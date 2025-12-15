@@ -1,0 +1,1391 @@
+import os
+import re
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+from datetime import datetime
+from openpyxl import Workbook, load_workbook
+
+
+# --------------------------------------------------------
+# 설비사 / 공정 선택 리스트
+# --------------------------------------------------------
+VENDOR_CHOICES = [
+    "", "AMAT", "ASM", "AXCELIS", "EUGENETECH", "WONIK_IPS",
+    "KOKUSAI", "LAM", "SEMES", "TEL", "TES", "ULVAC", "GCS"
+]
+
+PROCESS_CHOICES = [
+    "", "CVD", "DIFF", "IMP", "ETCH", "METAL", "CLEAN", "GCS"
+]
+
+
+# --------------------------------------------------------
+# 공통 유틸 함수
+# --------------------------------------------------------
+def norm(text):
+    if text is None:
+        return ""
+    return str(text).strip().lower()
+
+
+def norm_name(text):
+    if text is None:
+        return ""
+    return str(text).strip()
+
+
+def sanitize_filename_part(s: str) -> str:
+    if s is None:
+        s = ""
+    s = str(s).strip()
+    bad = ['\\', '/', ':', '*', '?', '"', '<', '>', '|']
+    for ch in bad:
+        s = s.replace(ch, '_')
+    return s
+
+
+def hide_rows_with_value_in_col(ws, col_idx: int, value, exclude_rows=None):
+    if exclude_rows is None:
+        exclude_rows = []
+
+    v_str = str(value).strip()
+    for r in range(1, ws.max_row + 1):
+        if r in exclude_rows:
+            continue
+        cell_val = ws.cell(row=r, column=col_idx).value
+        if str(cell_val).strip() == v_str:
+            ws.row_dimensions[r].hidden = True
+
+
+def parse_quote_filename_g(name: str):
+    """
+    G열 형식:
+      YYMMDD_LOT베큠_라인_공정_투자자(설비호기)   또는 뒤에 .xlsx/.xlsm 포함 가능
+    반환:
+      (line, proc, investor, tool) 또는 None
+    """
+    if not name:
+        return None
+
+    s = str(name).strip()
+    s = re.sub(r"\.(xlsx|xlsm|xls)$", "", s, flags=re.IGNORECASE)
+
+    if "_LOT베큠_" not in s:
+        return None
+
+    try:
+        body = s.split("_LOT베큠_", 1)[1]
+        parts = body.split("_")
+        if len(parts) < 3:
+            return None
+
+        line = parts[0].strip()
+        proc = parts[1].strip()
+        inv_tool = "_".join(parts[2:]).strip()
+
+        investor = inv_tool
+        tool = ""
+
+        m = re.match(r"^(.*)\((.*)\)$", inv_tool)
+        if m:
+            investor = m.group(1).strip()
+            tool = m.group(2).strip()
+
+        return (line, proc, investor, tool)
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------
+# 갑지 DATA 생성 전용 클래스
+# --------------------------------------------------------
+class GabjiBuilder:
+    def __init__(self, parent_ui):
+        self.ui = parent_ui
+
+    def _build_gabji_data_from_paths(self, quote_paths):
+        if not quote_paths:
+            messagebox.showwarning("알림", "대상 견적서가 없습니다.")
+            return
+
+        template_path = self.ui.gabji_template_path
+        if not template_path or not os.path.exists(template_path):
+            messagebox.showwarning("알림", "갑지 DATA 양식을 먼저 선택하세요.")
+            return
+
+        save_folder = self.ui.quote_save_folder
+        if not save_folder or not os.path.isdir(save_folder):
+            messagebox.showwarning("알림", "견적 저장폴더를 먼저 선택하세요.")
+            return
+
+        ext = os.path.splitext(template_path)[1].lower()
+        keep_vba = (ext == ".xlsm")
+
+        try:
+            wb_t = load_workbook(template_path, keep_vba=keep_vba)
+        except Exception as e:
+            messagebox.showerror("오류", f"갑지 DATA 양식 엑셀 로드 실패:\n{e}")
+            return
+
+        if "갑지 DATA" not in wb_t.sheetnames:
+            messagebox.showerror("오류", '"갑지 DATA" 시트를 찾을 수 없습니다.')
+            return
+
+        ws_g = wb_t["갑지 DATA"]
+        max_row = ws_g.max_row
+        max_col = ws_g.max_column
+
+        # 2행부터 값만 초기화(스타일 유지)
+        if max_row >= 2:
+            for r in range(2, max_row + 1):
+                for c in range(1, max_col + 1):
+                    ws_g.cell(row=r, column=c).value = None
+
+        # 데이터 수집
+        combined_rows = []
+        for q_path in quote_paths:
+            if not os.path.exists(q_path):
+                continue
+            try:
+                wb_q = load_workbook(q_path, data_only=True)
+            except Exception:
+                continue
+
+            if "견적의뢰복사본" not in wb_q.sheetnames:
+                wb_q.close()
+                continue
+
+            ws_q = wb_q["견적의뢰복사본"]
+            for row in ws_q.iter_rows(min_row=2, values_only=True):
+                if not row or all(v is None for v in row):
+                    continue
+                combined_rows.append(list(row))
+
+            wb_q.close()
+
+        if not combined_rows:
+            messagebox.showwarning("알림", "선택된 견적서들에서 가져올 데이터가 없습니다.")
+            return
+
+        # D열 기준 정렬(혼합 타입 안전)
+        def sort_key(r):
+            if len(r) <= 3:
+                return (1, "")
+            d_val = r[3]
+            if d_val is None:
+                return (1, "")
+            return (0, str(d_val))
+
+        combined_rows.sort(key=sort_key)
+
+        # 스타일 복사
+        def copy_row_style(ws, src_row, dest_row, max_col_):
+            for col in range(1, max_col_ + 1):
+                src_cell = ws.cell(row=src_row, column=col)
+                dest_cell = ws.cell(row=dest_row, column=col)
+                dest_cell._style = src_cell._style
+
+        # 입력(2행부터)
+        start_row = 2
+        current_max_row = ws_g.max_row
+
+        for i, row_vals in enumerate(combined_rows, start=start_row):
+            if i > current_max_row:
+                ws_g.insert_rows(i)
+                copy_row_style(ws_g, 2, i, max_col)
+                current_max_row += 1
+            else:
+                copy_row_style(ws_g, 2, i, max_col)
+
+            for c, val in enumerate(row_vals, start=1):
+                ws_g.cell(row=i, column=c).value = val
+
+        # 파일명 생성(복사 후 K2/J2 읽기)
+        k2_val = ws_g["K2"].value
+        j2_val = ws_g["J2"].value
+        k2 = sanitize_filename_part(k2_val)
+        j2 = sanitize_filename_part(j2_val)
+
+        today = datetime.now().strftime("%y%m%d")
+        base_filename = f"{today}_LOT베큠_{k2}_{j2}.xlsx"
+        filename = base_filename
+        path = os.path.join(save_folder, filename)
+
+        # 중복 방지
+        if os.path.exists(path):
+            name_only, ext_only = os.path.splitext(base_filename)
+            counter = 1
+            while True:
+                filename = f"{name_only}_{counter}{ext_only}"
+                path = os.path.join(save_folder, filename)
+                if not os.path.exists(path):
+                    break
+                counter += 1
+
+        try:
+            wb_t.save(path)
+        except Exception as e:
+            messagebox.showerror("오류", f"갑지 DATA 파일 저장 실패:\n{e}")
+            return
+
+        messagebox.showinfo("완료", f"갑지 DATA 파일이 저장되었습니다.\n{path}")
+
+    def build_auto(self, selected_paths):
+        self._build_gabji_data_from_paths(selected_paths)
+
+    def build_manual(self):
+        files = self.ui.ask_files("갑지 DATA 작성 필요 견적서 선택", [("Excel 파일", "*.xlsx *.xlsm")])
+        if not files:
+            return
+        self._build_gabji_data_from_paths(list(files))
+
+
+# --------------------------------------------------------
+# 메인 GUI 클래스
+# --------------------------------------------------------
+class QuoteBuilderGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("견적서 작성 자동화 ver.1.1")
+        self.root.geometry("1680x900")
+
+        # 품목/견적 데이터
+        self.items = []
+        self.quote_lines = []
+
+        # 매핑
+        self.name_to_index = {}
+        self.code_to_indexes = {}
+        self.code_qty = {}
+
+        # 입력 변수
+        self.code_var = tk.StringVar()
+        self.vendor_var = tk.StringVar()
+        self.proc_var = tk.StringVar()
+
+        # 품목 필터
+        self.filter_var = tk.StringVar()
+
+        # 파일/폴더 선택 유지
+        self.item_excel_path = None
+        self.quote_template_path = None
+        self.quote_save_folder = None
+        self.gabji_template_path = None
+
+        # 상태 라벨 변수
+        self.item_excel_label_var = tk.StringVar(value="선택 필요")
+        self.quote_template_label_var = tk.StringVar(value="선택 필요")
+        self.quote_folder_label_var = tk.StringVar(value="선택 필요")
+        self.gabji_template_label_var = tk.StringVar(value="선택 필요")
+
+        # UI 라벨 위젯 참조(색 바꾸기)
+        self.lbl_item_excel = None
+        self.lbl_quote_template = None
+        self.lbl_quote_folder = None
+        self.lbl_gabji_template = None
+
+        # 생성된 견적서 리스트
+        self.saved_quotes = []
+
+        # 히스토리(로그 기반)
+        self.line_history = []
+        self.proc_history = []
+        self.inv_history = []
+        self.tool_history = []
+        self.latest_quad_from_log = None
+
+        # 합계
+        self.total_amount = 0
+        self.total_qty = 0
+
+        # 갑지 빌더
+        self.gabji_builder = GabjiBuilder(parent_ui=self)
+
+        self.build_ui()
+        self.load_history_from_log()
+        self.refresh_tree()
+
+    # ----- file dialogs wrappers -----
+    def ask_file(self, title, filetypes):
+        return filedialog.askopenfilename(title=title, filetypes=filetypes)
+
+    def ask_files(self, title, filetypes):
+        return filedialog.askopenfilenames(title=title, filetypes=filetypes)
+
+    def ask_folder(self, title):
+        return filedialog.askdirectory(title=title)
+
+    # --------------------------------------------------------
+    # UI (배치 수정 완료 버전)
+    # --------------------------------------------------------
+    def build_ui(self):
+        top = tk.Frame(self.root)
+        top.pack(fill=tk.X, padx=10, pady=10)
+
+        BTN_H = 2
+        PADX = 6
+        PADY = 2
+
+        # 좌측 상단: 품목/양식/폴더/갑지양식
+        top_left = tk.Frame(top)
+        top_left.pack(side=tk.LEFT, anchor="nw")
+
+        # 4열로 확장 (갑지 DATA 양식 선택을 견적 저장폴더 옆으로)
+        for c in range(4):
+            top_left.grid_columnconfigure(c, minsize=210)
+
+        btn_item = tk.Button(
+            top_left, text="품목 EXCEL LOAD",
+            command=self.load_items_from_excel,
+            font=("맑은 고딕", 11, "bold"),
+            height=BTN_H, width=18
+        )
+        btn_item.grid(row=0, column=0, padx=(0, PADX), pady=(0, PADY), sticky="w")
+
+        self.lbl_item_excel = tk.Label(
+            top_left, textvariable=self.item_excel_label_var,
+            font=("맑은 고딕", 8), fg="red", width=24, anchor="w"
+        )
+        self.lbl_item_excel.grid(row=1, column=0, padx=(0, PADX), sticky="w")
+
+        btn_tpl = tk.Button(
+            top_left, text="견적서 양식 선택",
+            command=self.select_quote_template,
+            font=("맑은 고딕", 11),
+            height=BTN_H, width=18
+        )
+        btn_tpl.grid(row=0, column=1, padx=(0, PADX), pady=(0, PADY), sticky="w")
+
+        self.lbl_quote_template = tk.Label(
+            top_left, textvariable=self.quote_template_label_var,
+            font=("맑은 고딕", 8), fg="red", width=24, anchor="w"
+        )
+        self.lbl_quote_template.grid(row=1, column=1, padx=(0, PADX), sticky="w")
+
+        btn_folder = tk.Button(
+            top_left, text="견적 저장폴더 선택",
+            command=self.select_quote_folder,
+            font=("맑은 고딕", 11),
+            height=BTN_H, width=18
+        )
+        btn_folder.grid(row=0, column=2, padx=(0, PADX), pady=(0, PADY), sticky="w")
+
+        self.lbl_quote_folder = tk.Label(
+            top_left, textvariable=self.quote_folder_label_var,
+            font=("맑은 고딕", 8), fg="red", width=24, anchor="w"
+        )
+        self.lbl_quote_folder.grid(row=1, column=2, padx=(0, PADX), sticky="w")
+
+        # [이동] 갑지 DATA 양식 선택 버튼을 상단으로 (견적 저장폴더 옆)
+        btn_gabji_tpl = tk.Button(
+            top_left, text="갑지 DATA 양식 선택",
+            command=self.select_gabji_template,
+            font=("맑은 고딕", 11),
+            height=BTN_H, width=18
+        )
+        btn_gabji_tpl.grid(row=0, column=3, padx=(0, PADX), pady=(0, PADY), sticky="w")
+
+        self.lbl_gabji_template = tk.Label(
+            top_left, textvariable=self.gabji_template_label_var,
+            font=("맑은 고딕", 8), fg="red", width=24, anchor="w"
+        )
+        self.lbl_gabji_template.grid(row=1, column=3, padx=(0, PADX), sticky="w")
+
+        # 우측 상단: 로그/저장
+        top_right = tk.Frame(top)
+        top_right.pack(side=tk.RIGHT, anchor="ne")
+
+        btn_log = tk.Button(
+            top_right, text="견적로그 OPEN",
+            command=self.open_log,
+            font=("맑은 고딕", 11),
+            height=BTN_H, width=14
+        )
+        btn_log.pack(side=tk.LEFT, padx=(0, PADX))
+
+        btn_export = tk.Button(
+            top_right, text="견적 엑셀로 저장",
+            command=self.export_to_excel,
+            font=("맑은 고딕", 11),
+            height=BTN_H, width=14
+        )
+        btn_export.pack(side=tk.LEFT)
+
+        # 메인 프레임
+        main = tk.Frame(self.root)
+        main.pack(fill=tk.BOTH, expand=True, padx=10)
+
+        left = tk.Frame(main)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        right = tk.Frame(main)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(20, 0))
+
+        # ----------------------------------------------------
+        # 좌측 상단: 코드/공정/설비사/추천
+        # ----------------------------------------------------
+        code_frame = tk.Frame(left)
+        code_frame.pack(fill=tk.X, pady=3)
+        code_frame.columnconfigure(1, weight=1)
+
+        tk.Label(code_frame, text="코드:", font=("맑은 고딕", 10)).grid(row=0, column=0, sticky="w")
+        code_entry = tk.Entry(code_frame, textvariable=self.code_var)
+        code_entry.grid(row=0, column=1, sticky="we", padx=5)
+        code_entry.bind("<Return>", lambda e: self.apply_code_filter())
+
+        tk.Label(code_frame, text="공정:", font=("맑은 고딕", 10)).grid(row=1, column=0, sticky="w")
+        proc_combo = ttk.Combobox(code_frame, textvariable=self.proc_var, values=PROCESS_CHOICES, state="readonly")
+        proc_combo.grid(row=1, column=1, sticky="w", padx=5)
+        proc_combo.current(0)
+
+        tk.Label(code_frame, text="설비사:", font=("맑은 고딕", 10)).grid(row=2, column=0, sticky="w")
+        vendor_combo = ttk.Combobox(code_frame, textvariable=self.vendor_var, values=VENDOR_CHOICES, state="readonly")
+        vendor_combo.grid(row=2, column=1, sticky="w", padx=5)
+        vendor_combo.current(0)
+
+        tk.Button(code_frame, text="추천 적용", command=self.apply_code_filter).grid(
+            row=0, column=2, rowspan=3, padx=10
+        )
+
+        hint = tk.Frame(left)
+        hint.pack(fill=tk.X, padx=5)
+        tk.Label(hint, text="※ 5D Object명이 여러개일 경우 '", font=("맑은 고딕", 8)).pack(side=tk.LEFT)
+        tk.Label(hint, text="+", fg="red", font=("맑은 고딕", 8, "bold")).pack(side=tk.LEFT)
+        tk.Label(hint, text="' 로 구분하여 입력  ex) AAA_R01+BBB_R02", font=("맑은 고딕", 8)).pack(side=tk.LEFT)
+
+        # ----------------------------------------------------
+        # 좌측: 품목 목록(필터 + Treeview)
+        # ----------------------------------------------------
+        filter_frame = tk.Frame(left)
+        filter_frame.pack(fill=tk.X, padx=5, pady=(5, 0))
+
+        tk.Label(filter_frame, text="검색:", font=("맑은 고딕", 9)).pack(side=tk.LEFT)
+        filter_entry = tk.Entry(filter_frame, textvariable=self.filter_var, width=25)
+        filter_entry.pack(side=tk.LEFT, padx=5)
+        filter_entry.bind("<KeyRelease>", self.on_filter_change)
+
+        tk.Label(left, text="품목 목록", font=("맑은 고딕", 10, "bold")).pack(anchor="w")
+
+        left_frame = tk.Frame(left)
+        left_frame.pack(fill=tk.BOTH, expand=True)
+
+        cols_left = ("category", "name", "price", "note")
+        self.left_tree = ttk.Treeview(left_frame, columns=cols_left, show="headings")
+        self.left_tree.heading("category", text="분류")
+        self.left_tree.heading("name", text="품목명")
+        self.left_tree.heading("price", text="단가")
+        self.left_tree.heading("note", text="비고")
+        self.left_tree.column("category", width=150, anchor="center")
+        self.left_tree.column("name", width=380, anchor="center")
+        self.left_tree.column("price", width=120, anchor="center")
+        self.left_tree.column("note", width=60, anchor="center")
+
+        left_scroll = ttk.Scrollbar(left_frame, orient="vertical", command=self.left_tree.yview)
+        self.left_tree.configure(yscrollcommand=left_scroll.set)
+        self.left_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        left_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.left_tree.tag_configure("used_item", background="#e6ffe6")
+
+        self.left_tree.bind("<Button-1>", self.on_drag_start_left)
+        self.left_tree.bind("<ButtonRelease-1>", self.on_drag_release_left)
+        self.left_tree.bind("<Double-1>", self.on_double_click_add_left)
+
+        # ----------------------------------------------------
+        # 우측 상단: 견적 품목
+        # ----------------------------------------------------
+        tk.Label(right, text="견적 품목", font=("맑은 고딕", 10, "bold")).pack(anchor="w")
+
+        right_top_frame = tk.Frame(right)
+        right_top_frame.pack(fill=tk.BOTH, expand=True)
+
+        cols_right = ("op", "category", "name", "qty", "unit_price", "amount")
+        self.tree = ttk.Treeview(right_top_frame, columns=cols_right, show="headings")
+        self.tree.heading("op", text="작업")
+        self.tree.heading("category", text="분류")
+        self.tree.heading("name", text="품목명")
+        self.tree.heading("qty", text="수량")
+        self.tree.heading("unit_price", text="단가")
+        self.tree.heading("amount", text="금액")
+        self.tree.column("op", width=60, anchor="center")
+        self.tree.column("category", width=130, anchor="center")
+        self.tree.column("name", width=320, anchor="center")
+        self.tree.column("qty", width=80, anchor="center")
+        self.tree.column("unit_price", width=120, anchor="center")
+        self.tree.column("amount", width=120, anchor="center")
+
+        right_top_scroll = ttk.Scrollbar(right_top_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=right_top_scroll.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right_top_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.tree.tag_configure("total_row", background="#f0f0ff")
+
+        self.tree.bind("<Button-1>", self.on_tree_click)
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
+        self.tree.bind("<Delete>", self.on_tree_delete_key)
+        self.tree.focus_set()
+
+        bottom_op_frame = tk.Frame(right)
+        bottom_op_frame.pack(fill=tk.X, pady=(3, 5))
+        tk.Button(
+            bottom_op_frame, text="전체삭제",
+            command=self.clear_all_quotes,
+            font=("맑은 고딕", 9),
+            bg="#ffdddd"
+        ).pack(side=tk.LEFT)
+
+        # ----------------------------------------------------
+        # 우측 하단: 견적서 리스트 (+ 전체선택 위치 수정)
+        # ----------------------------------------------------
+        tk.Label(right, text="견적서 리스트", font=("맑은 고딕", 10, "bold")).pack(anchor="w", pady=(10, 0))
+
+        # [이동] 전체선택 버튼을 '선택(체크)열' 바로 위쪽으로
+        quote_toolbar = tk.Frame(right)
+        quote_toolbar.pack(fill=tk.X, pady=(3, 2))
+        tk.Button(
+            quote_toolbar, text="전체선택",
+            command=self.toggle_select_all_quotes,
+            font=("맑은 고딕", 9),
+            width=8
+        ).pack(side=tk.LEFT)  # 체크열이 왼쪽이라 왼쪽 정렬이 가장 직관적
+
+        bottom_frame = tk.Frame(right)
+        bottom_frame.pack(fill=tk.BOTH, expand=True)
+
+        cols_files = ("chk", "filename", "folder")
+        self.quote_tree = ttk.Treeview(bottom_frame, columns=cols_files, show="headings")
+        self.quote_tree.heading("chk", text="선택")
+        self.quote_tree.heading("filename", text="파일명")
+        self.quote_tree.heading("folder", text="폴더")
+        self.quote_tree.column("chk", width=60, anchor="center")
+        self.quote_tree.column("filename", width=260, anchor="w")
+        self.quote_tree.column("folder", width=260, anchor="w")
+
+        quote_scroll = ttk.Scrollbar(bottom_frame, orient="vertical", command=self.quote_tree.yview)
+        self.quote_tree.configure(yscrollcommand=quote_scroll.set)
+        self.quote_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        quote_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.quote_tree.bind("<Button-1>", self.on_quote_tree_click)
+        self.quote_tree.bind("<Double-1>", self.on_quote_tree_double_click)
+
+        # 갑지 DATA 버튼(자동/수동)
+        btn_gabji_frame = tk.Frame(right)
+        btn_gabji_frame.pack(anchor="e", pady=5)
+
+        tk.Button(
+            btn_gabji_frame, text="갑지 DATA 자동생성",
+            command=self.build_gabji_data_auto,
+            font=("맑은 고딕", 10, "bold"),
+            bg="#ddeeff"
+        ).pack(side=tk.LEFT, padx=5)
+
+        tk.Button(
+            btn_gabji_frame, text="갑지 DATA 수동생성",
+            command=self.build_gabji_data_manual,
+            font=("맑은 고딕", 10),
+            bg="#eeeeee"
+        ).pack(side=tk.LEFT, padx=5)
+
+    # --------------------------------------------------------
+    # 상단 선택 기능
+    # --------------------------------------------------------
+    def select_quote_template(self):
+        path = filedialog.askopenfilename(
+            title="견적서 양식 선택",
+            filetypes=[("Excel 파일", "*.xlsx *.xlsm")]
+        )
+        if not path:
+            return
+        self.quote_template_path = path
+        self.quote_template_label_var.set(os.path.basename(path))
+        self.lbl_quote_template.config(fg="black")
+
+    def select_quote_folder(self):
+        folder = filedialog.askdirectory(title="견적 저장폴더 선택")
+        if not folder:
+            return
+        self.quote_save_folder = folder
+        name = os.path.basename(folder.rstrip("\\/")) or folder
+        self.quote_folder_label_var.set(name)
+        self.lbl_quote_folder.config(fg="black")
+
+    def select_gabji_template(self):
+        path = filedialog.askopenfilename(
+            title="갑지 DATA 양식 선택",
+            filetypes=[("Excel 파일", "*.xlsx *.xlsm")]
+        )
+        if not path:
+            return
+        self.gabji_template_path = path
+        self.gabji_template_label_var.set(os.path.basename(path))
+        self.lbl_gabji_template.config(fg="black")
+
+    # --------------------------------------------------------
+    # 로그 기반 히스토리 로딩
+    # --------------------------------------------------------
+    def load_history_from_log(self):
+        log_path = "견적로그.xlsx"
+        if not os.path.exists(log_path):
+            self.latest_quad_from_log = None
+            return
+
+        try:
+            wb = load_workbook(log_path, data_only=True)
+            if "Log" not in wb.sheetnames:
+                wb.close()
+                return
+            ws = wb["Log"]
+        except Exception:
+            return
+
+        records = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            filename_g = row[6]
+            if not filename_g:
+                continue
+            parsed = parse_quote_filename_g(filename_g)
+            if parsed:
+                records.append(parsed)
+
+        wb.close()
+
+        if not records:
+            self.latest_quad_from_log = None
+            return
+
+        self.latest_quad_from_log = records[-1]
+
+        def uniq(seq):
+            seen = set()
+            out = []
+            for x in seq:
+                if x in seen:
+                    continue
+                seen.add(x)
+                out.append(x)
+            return out
+
+        rev = list(reversed(records))
+        self.line_history = uniq([r[0] for r in rev if r[0]])
+        self.proc_history = uniq([r[1] for r in rev if r[1]])
+        self.inv_history = uniq([r[2] for r in rev if r[2]])
+        self.tool_history = uniq([r[3] for r in rev if r[3]])
+
+    # --------------------------------------------------------
+    # 품목 실시간 필터
+    # --------------------------------------------------------
+    def on_filter_change(self, event=None):
+        self.rebuild_left_tree()
+
+    def rebuild_left_tree(self):
+        self.left_tree.delete(*self.left_tree.get_children())
+        keyword = (self.filter_var.get() or "").strip().lower()
+
+        for idx, item in enumerate(self.items):
+            name_lower = str(item["name"]).lower()
+            if keyword and keyword not in name_lower:
+                continue
+            self.left_tree.insert(
+                "", tk.END, iid=str(idx),
+                values=(item["category"], item["name"], f"{item['price']:,}", "")
+            )
+
+        self.update_left_highlight()
+
+    def update_left_highlight(self):
+        used_indices = {line.get("idx") for line in self.quote_lines if "idx" in line}
+        for iid in self.left_tree.get_children():
+            try:
+                idx = int(iid)
+            except ValueError:
+                continue
+            if idx in used_indices:
+                self.left_tree.item(iid, tags=("used_item",))
+            else:
+                self.left_tree.item(iid, tags=())
+
+    # --------------------------------------------------------
+    # 라인/공정/투자자/설비호기 입력
+    # --------------------------------------------------------
+    def _add_history(self, history_list, value):
+        value = (value or "").strip()
+        if not value:
+            return
+        if value in history_list:
+            history_list.remove(value)
+        history_list.insert(0, value)
+        if len(history_list) > 10:
+            del history_list[10:]
+
+    def ask_line_proc_investor(self):
+        result = {"quad": None}
+
+        top = tk.Toplevel(self.root)
+        top.title("라인 / 공정 / 투자자 / 설비호기 입력")
+        top.transient(self.root)
+        top.grab_set()
+        top.attributes("-topmost", True)
+
+        frm = tk.Frame(top)
+        frm.pack(padx=15, pady=15)
+
+        tk.Label(frm, text="라인:", font=("맑은 고딕", 10)).grid(row=0, column=0, sticky="w", pady=3)
+        line_combo = ttk.Combobox(frm, values=self.line_history, state="normal", width=25)
+        line_combo.grid(row=0, column=1, pady=3)
+
+        tk.Label(frm, text="공정:", font=("맑은 고딕", 10)).grid(row=1, column=0, sticky="w", pady=3)
+        proc_combo = ttk.Combobox(frm, values=self.proc_history or PROCESS_CHOICES, state="normal", width=25)
+        proc_combo.grid(row=1, column=1, pady=3)
+
+        tk.Label(frm, text="투자자:", font=("맑은 고딕", 10)).grid(row=2, column=0, sticky="w", pady=3)
+        inv_combo = ttk.Combobox(frm, values=self.inv_history, state="normal", width=25)
+        inv_combo.grid(row=2, column=1, pady=3)
+
+        tk.Label(frm, text="설비호기:", font=("맑은 고딕", 10)).grid(row=3, column=0, sticky="w", pady=3)
+        tool_combo = ttk.Combobox(frm, values=self.tool_history, state="normal", width=25)
+        tool_combo.grid(row=3, column=1, pady=3)
+
+        if self.latest_quad_from_log:
+            line_combo.set(self.latest_quad_from_log[0])
+            proc_combo.set(self.latest_quad_from_log[1])
+            inv_combo.set(self.latest_quad_from_log[2])
+            tool_combo.set(self.latest_quad_from_log[3])
+        else:
+            if self.line_history:
+                line_combo.set(self.line_history[0])
+            if self.proc_history:
+                proc_combo.set(self.proc_history[0])
+            if self.inv_history:
+                inv_combo.set(self.inv_history[0])
+            if self.tool_history:
+                tool_combo.set(self.tool_history[0])
+
+        def on_ok(event=None):
+            line_name = (line_combo.get() or "").strip()
+            proc_name = (proc_combo.get() or "").strip()
+            investor = (inv_combo.get() or "").strip()
+            tool = (tool_combo.get() or "").strip()
+
+            if not line_name or not proc_name or not investor:
+                messagebox.showwarning("알림", "라인, 공정, 투자자는 모두 입력하세요.", parent=top)
+                return
+
+            self._add_history(self.line_history, line_name)
+            self._add_history(self.proc_history, proc_name)
+            self._add_history(self.inv_history, investor)
+            self._add_history(self.tool_history, tool)
+
+            result["quad"] = (line_name, proc_name, investor, tool)
+            top.destroy()
+
+        def on_cancel():
+            result["quad"] = None
+            top.destroy()
+
+        btn_frame = tk.Frame(top)
+        btn_frame.pack(pady=(5, 10))
+        tk.Button(btn_frame, text="확인", command=on_ok, width=8).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="취소", command=on_cancel, width=8).pack(side=tk.LEFT, padx=5)
+
+        top.bind("<Return>", on_ok)
+        top.protocol("WM_DELETE_WINDOW", on_cancel)
+
+        top.update_idletasks()
+        x = self.root.winfo_rootx() + 250
+        y = self.root.winfo_rooty() + 200
+        top.geometry(f"+{x}+{y}")
+
+        line_combo.focus_set()
+        self.root.wait_window(top)
+        return result["quad"]
+
+    # --------------------------------------------------------
+    # 견적로그 열기
+    # --------------------------------------------------------
+    def open_log(self):
+        log_path = "견적로그.xlsx"
+        if not os.path.exists(log_path):
+            messagebox.showinfo("알림", "견적로그.xlsx 파일이 없습니다.")
+            return
+        try:
+            os.startfile(log_path)
+        except Exception as e:
+            messagebox.showerror("오류", f"견적로그를 여는 중 오류가 발생했습니다.\n\n{e}")
+
+    # --------------------------------------------------------
+    # 품목 엑셀 로드
+    # --------------------------------------------------------
+    def load_items_from_excel(self):
+        path = filedialog.askopenfilename(
+            title="품목 엑셀 파일 선택",
+            filetypes=[("Excel 파일", "*.xlsx *.xlsm *.xls")]
+        )
+        if not path:
+            return
+
+        try:
+            wb = load_workbook(path, data_only=True)
+
+            if "품목" not in wb.sheetnames:
+                messagebox.showerror("오류", "'품목' 시트를 찾을 수 없습니다.")
+                return
+
+            ws_items = wb["품목"]
+
+            self.items.clear()
+            self.quote_lines.clear()
+            self.left_tree.delete(*self.left_tree.get_children())
+            self.tree.delete(*self.tree.get_children())
+            self.name_to_index.clear()
+            self.code_to_indexes.clear()
+            self.code_qty.clear()
+
+            for row in ws_items.iter_rows(min_row=2, values_only=True):
+                if not row:
+                    continue
+                category = row[0]
+                name = row[1]
+                price = row[2] if len(row) > 2 else 0
+                if not name:
+                    continue
+                try:
+                    price = int(price)
+                except Exception:
+                    price = 0
+                if price == 0:
+                    continue
+
+                name_key = norm_name(name)
+                idx = len(self.items)
+                item = {"category": category or "", "name": str(name), "price": price}
+                self.items.append(item)
+                self.name_to_index[name_key] = idx
+
+            if "코드매핑" in wb.sheetnames:
+                ws_codes = wb["코드매핑"]
+                for row in ws_codes.iter_rows(min_row=2, values_only=True):
+                    if not row:
+                        continue
+                    code = row[0]
+                    proc = row[1]
+                    vendor = row[2]
+                    item_name = row[3]
+                    qty = row[4] if len(row) > 4 else ""
+                    if not code or not item_name:
+                        continue
+                    name_key = norm_name(item_name)
+                    if name_key not in self.name_to_index:
+                        continue
+                    idx = self.name_to_index[name_key]
+                    full_key = f"{norm(code)}|{norm(proc)}|{norm(vendor)}"
+                    self.code_to_indexes.setdefault(full_key, set()).add(idx)
+                    self.code_qty[(full_key, idx)] = qty if qty is not None else ""
+
+            wb.close()
+
+            self.rebuild_left_tree()
+            self.refresh_tree()
+
+            self.item_excel_path = path
+            self.item_excel_label_var.set(os.path.basename(path))
+            self.lbl_item_excel.config(fg="black")
+
+            messagebox.showinfo("완료", f"품목 {len(self.items)}개 로드 완료")
+
+        except Exception as e:
+            messagebox.showerror("오류", f"엑셀 로딩 실패:\n{e}")
+
+    # --------------------------------------------------------
+    # 추천 적용
+    # --------------------------------------------------------
+    def apply_code_filter(self):
+        raw_code = self.code_var.get()
+        vendor = self.vendor_var.get()
+        proc = self.proc_var.get()
+
+        children = self.left_tree.get_children()
+
+        if not raw_code.strip():
+            for iid in children:
+                vals = list(self.left_tree.item(iid, "values"))
+                vals[3] = ""
+                self.left_tree.item(iid, values=vals)
+            return
+
+        if not vendor.strip() or not proc.strip():
+            messagebox.showwarning("알림", "공정과 설비사를 모두 선택하세요.")
+            return
+
+        full_key = f"{norm(raw_code)}|{norm(proc)}|{norm(vendor)}"
+        matched_indexes = self.code_to_indexes.get(full_key, None)
+
+        if not matched_indexes:
+            messagebox.showinfo(
+                "매핑 없음",
+                f"다음 조합에 대한 매핑이 없습니다.\n\n코드: {raw_code}\n공정: {proc}\n설비사: {vendor}"
+            )
+            for iid in children:
+                vals = list(self.left_tree.item(iid, "values"))
+                vals[3] = ""
+                self.left_tree.item(iid, values=vals)
+            return
+
+        for iid in children:
+            idx = int(iid)
+            vals = list(self.left_tree.item(iid, "values"))
+            if idx in matched_indexes:
+                qty_raw = self.code_qty.get((full_key, idx), "")
+                vals[3] = qty_raw
+            else:
+                vals[3] = ""
+            self.left_tree.item(iid, values=vals)
+
+        for idx in matched_indexes:
+            qty_raw = self.code_qty.get((full_key, idx), 1)
+            qty = 1
+            try:
+                if str(qty_raw).strip() != "":
+                    qty = int(qty_raw)
+            except Exception:
+                qty = 1
+            self.add_item_auto(idx, qty)
+
+        rows = []
+        for iid in children:
+            vals = list(self.left_tree.item(iid, "values"))
+            note = vals[3]
+            rows.append((iid, vals, note))
+        rows.sort(key=lambda r: 0 if str(r[2]).strip() != "" else 1)
+
+        self.left_tree.delete(*children)
+        for iid, vals, _note in rows:
+            self.left_tree.insert("", tk.END, iid=iid, values=vals)
+
+        self.update_left_highlight()
+
+    # --------------------------------------------------------
+    # 견적 추가/드래그
+    # --------------------------------------------------------
+    def add_item_auto(self, idx, qty):
+        if idx < 0 or idx >= len(self.items):
+            return
+        item = self.items[idx]
+        for line in self.quote_lines:
+            if line.get("idx") == idx:
+                line["qty"] += qty
+                line["amount"] = line["qty"] * line["price"]
+                self.refresh_tree()
+                return
+        self.quote_lines.append({
+            "idx": idx,
+            "category": item["category"],
+            "name": item["name"],
+            "qty": qty,
+            "price": item["price"],
+            "amount": item["price"] * qty
+        })
+        self.refresh_tree()
+
+    def on_drag_start_left(self, event):
+        self.drag_item = self.left_tree.identify_row(event.y)
+
+    def on_drag_release_left(self, event):
+        if not getattr(self, "drag_item", None):
+            return
+        widget = event.widget.winfo_containing(event.x_root, event.y_root)
+        if widget == self.tree or widget in self.tree.winfo_children():
+            try:
+                idx = int(self.drag_item)
+            except Exception:
+                self.drag_item = None
+                return
+            self.add_item_with_quantity(idx)
+        self.drag_item = None
+
+    def on_double_click_add_left(self, event):
+        iid = self.left_tree.identify_row(event.y)
+        if iid:
+            try:
+                idx = int(iid)
+            except Exception:
+                return
+            self.add_item_with_quantity(idx)
+
+    def add_item_with_quantity(self, idx):
+        if idx < 0 or idx >= len(self.items):
+            return
+        qty = simpledialog.askinteger("수량 입력", "수량을 입력하세요:", minvalue=1, parent=self.root)
+        if not qty:
+            return
+        self.add_item_auto(idx, qty)
+
+    # --------------------------------------------------------
+    # 견적 Tree / 합계
+    # --------------------------------------------------------
+    def update_total(self):
+        self.total_amount = sum(line["amount"] for line in self.quote_lines)
+        self.total_qty = sum(line["qty"] for line in self.quote_lines)
+
+    def refresh_tree(self):
+        self.tree.delete(*self.tree.get_children())
+        self.update_total()
+
+        for idx, line in enumerate(self.quote_lines):
+            self.tree.insert(
+                "", tk.END, iid=str(idx),
+                values=("삭제", line["category"], line["name"], line["qty"],
+                        f"{line['price']:,}", f"{line['amount']:,}")
+            )
+
+        self.tree.insert(
+            "", tk.END, iid="total",
+            values=("", "합계", "", self.total_qty, "", f"{self.total_amount:,}"),
+            tags=("total_row",)
+        )
+
+        self.update_left_highlight()
+
+    def delete_quote_line(self, idx):
+        if idx < 0 or idx >= len(self.quote_lines):
+            return
+        name = self.quote_lines[idx]["name"]
+        if not messagebox.askyesno("삭제 확인", f"'{name}' 품목을 삭제하시겠습니까?"):
+            return
+        del self.quote_lines[idx]
+        self.refresh_tree()
+
+    def on_tree_click(self, event):
+        if self.tree.identify("region", event.x, event.y) != "cell":
+            return
+        col = self.tree.identify_column(event.x)
+        row_id = self.tree.identify_row(event.y)
+        if not row_id or row_id == "total":
+            return
+        if col == "#1":
+            try:
+                idx = int(row_id)
+            except ValueError:
+                return
+            self.delete_quote_line(idx)
+
+    def on_tree_double_click(self, event):
+        row_id = self.tree.identify_row(event.y)
+        col = self.tree.identify_column(event.x)
+        if not row_id or row_id == "total":
+            return
+        if col != "#4":
+            return
+        try:
+            idx = int(row_id)
+        except ValueError:
+            return
+        if idx < 0 or idx >= len(self.quote_lines):
+            return
+
+        current_qty = self.quote_lines[idx]["qty"]
+        new_qty = simpledialog.askinteger(
+            "수량 수정",
+            f"현재 수량: {current_qty}\n새 수량을 입력하세요 (0 입력 시 삭제):",
+            minvalue=0, parent=self.root
+        )
+        if new_qty is None:
+            return
+        if new_qty == 0:
+            self.delete_quote_line(idx)
+            return
+        self.quote_lines[idx]["qty"] = new_qty
+        self.quote_lines[idx]["amount"] = new_qty * self.quote_lines[idx]["price"]
+        self.refresh_tree()
+
+    def on_tree_delete_key(self, event):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        targets = [iid for iid in selected if iid != "total"]
+        if not targets:
+            return
+        if not messagebox.askyesno("삭제 확인", f"선택한 품목 {len(targets)}개를 삭제하시겠습니까?"):
+            return
+        idx_list = sorted([int(i) for i in targets], reverse=True)
+        for idx in idx_list:
+            del self.quote_lines[idx]
+        self.refresh_tree()
+
+    def clear_all_quotes(self):
+        if not self.quote_lines:
+            return
+        if not messagebox.askyesno("전체삭제 확인", "모든 견적 품목을 삭제하시겠습니까?"):
+            return
+        self.quote_lines.clear()
+        self.refresh_tree()
+
+    # --------------------------------------------------------
+    # 견적로그 저장
+    # --------------------------------------------------------
+    def save_log(self, proc_name, filename):
+        log_path = "견적로그.xlsx"
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        vendor = self.vendor_var.get()
+
+        if not os.path.exists(log_path):
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Log"
+            ws.append(["날짜", "공정", "설비사", "품목", "수량", "금액", "견적서파일명"])
+            wb.save(log_path)
+
+        wb = load_workbook(log_path)
+        ws = wb["Log"] if "Log" in wb.sheetnames else wb.active
+
+        for q in self.quote_lines:
+            ws.append([now, proc_name, vendor, q["name"], q["qty"], q["amount"], filename])
+
+        wb.save(log_path)
+        wb.close()
+
+        self.load_history_from_log()
+
+    # --------------------------------------------------------
+    # 견적서 리스트 UI
+    # --------------------------------------------------------
+    def add_saved_quote(self, path):
+        folder = os.path.dirname(path)
+        filename = os.path.basename(path)
+        self.saved_quotes.append({"path": path, "filename": filename, "folder": folder})
+        idx = len(self.saved_quotes) - 1
+        self.quote_tree.insert("", tk.END, iid=str(idx), values=("☐", filename, folder))
+
+    def on_quote_tree_click(self, event):
+        if self.quote_tree.identify("region", event.x, event.y) != "cell":
+            return
+        col = self.quote_tree.identify_column(event.x)
+        if col != "#1":
+            return
+        row_id = self.quote_tree.identify_row(event.y)
+        if not row_id:
+            return
+        vals = list(self.quote_tree.item(row_id, "values"))
+        if not vals:
+            return
+        vals[0] = "☑" if vals[0] != "☑" else "☐"
+        self.quote_tree.item(row_id, values=vals)
+
+    def on_quote_tree_double_click(self, event):
+        row_id = self.quote_tree.identify_row(event.y)
+        if not row_id:
+            return
+        try:
+            idx = int(row_id)
+        except ValueError:
+            return
+        if 0 <= idx < len(self.saved_quotes):
+            path = self.saved_quotes[idx]["path"]
+            if os.path.exists(path):
+                try:
+                    os.startfile(path)
+                except Exception as e:
+                    messagebox.showerror("오류", f"파일을 여는 중 오류:\n\n{e}")
+            else:
+                messagebox.showwarning("알림", f"파일이 존재하지 않습니다.\n{path}")
+
+    def toggle_select_all_quotes(self):
+        children = self.quote_tree.get_children()
+        if not children:
+            return
+
+        any_unchecked = False
+        for iid in children:
+            vals = self.quote_tree.item(iid, "values")
+            if vals and vals[0] != "☑":
+                any_unchecked = True
+                break
+
+        new_val = "☑" if any_unchecked else "☐"
+        for iid in children:
+            vals = list(self.quote_tree.item(iid, "values"))
+            if not vals:
+                continue
+            vals[0] = new_val
+            self.quote_tree.item(iid, values=vals)
+
+    # --------------------------------------------------------
+    # 견적 엑셀 저장
+    # --------------------------------------------------------
+    def export_to_excel(self):
+        if not self.quote_lines:
+            messagebox.showwarning("알림", "견적 품목이 없습니다.")
+            return
+
+        if not self.quote_template_path or not os.path.exists(self.quote_template_path):
+            messagebox.showwarning("알림", "견적서 양식을 먼저 선택하세요.")
+            return
+
+        if not self.quote_save_folder or not os.path.isdir(self.quote_save_folder):
+            messagebox.showwarning("알림", "견적 저장폴더를 먼저 선택하세요.")
+            return
+
+        quad = self.ask_line_proc_investor()
+        if quad is None:
+            return
+        line_name, proc_name, investor, tool = quad
+
+        template_path = self.quote_template_path
+        ext = os.path.splitext(template_path)[1].lower()
+        keep_vba = (ext == ".xlsm")
+
+        try:
+            wb = load_workbook(template_path, keep_vba=keep_vba)
+        except Exception as e:
+            messagebox.showerror("오류", f"양식 엑셀 로드 실패:\n{e}")
+            return
+
+        folder = self.quote_save_folder
+        today = datetime.now().strftime("%y%m%d")
+
+        safe_line = sanitize_filename_part(line_name)
+        safe_proc = sanitize_filename_part(proc_name)
+        safe_inv = sanitize_filename_part(investor)
+        safe_tool = sanitize_filename_part(tool)
+
+        base_filename = f"{today}_LOT베큠_{safe_line}_{safe_proc}_{safe_inv}({safe_tool}).xlsx"
+        filename = base_filename
+        path = os.path.join(folder, filename)
+
+        if os.path.exists(path):
+            name_only, ext_only = os.path.splitext(base_filename)
+            counter = 1
+            while True:
+                filename = f"{name_only}_{counter}{ext_only}"
+                path = os.path.join(folder, filename)
+                if not os.path.exists(path):
+                    break
+                counter += 1
+
+        total_amount = sum(x["amount"] for x in self.quote_lines)
+
+        from openpyxl.styles import Font, Alignment
+
+        if "견적서" in wb.sheetnames:
+            wb.remove(wb["견적서"])
+        ws_q = wb.create_sheet("견적서")
+
+        ws_q["A1"] = "견적서"
+        ws_q["A1"].font = Font(size=16, bold=True)
+        ws_q.merge_cells("A1:G1")
+        ws_q["A1"].alignment = Alignment(horizontal="center")
+
+        ws_q.append(["분류", "품목명", "", "", "단가", "수량", "금액"])
+        for cell in ws_q[2]:
+            cell.font = Font(bold=True)
+
+        for line in self.quote_lines:
+            ws_q.append([line["category"], line["name"], "", "", line["price"], line["qty"], line["amount"]])
+
+        ws_q.append(["", "", "", "", "", "합계", total_amount])
+
+        ws_q.column_dimensions["A"].width = 15
+        ws_q.column_dimensions["B"].width = 40
+        ws_q.column_dimensions["C"].width = 8
+        ws_q.column_dimensions["D"].width = 8
+        ws_q.column_dimensions["E"].width = 15
+        ws_q.column_dimensions["F"].width = 10
+        ws_q.column_dimensions["G"].width = 15
+
+        if "사양서" in wb.sheetnames:
+            ws_s = wb["사양서"]
+            rack_row = None
+            for r in range(1, ws_s.max_row + 1):
+                val = ws_s.cell(row=r, column=1).value
+                if isinstance(val, str) and val.strip() == "Rack system":
+                    rack_row = r
+                    break
+
+            if rack_row is not None:
+                row = rack_row + 1
+                for line in self.quote_lines:
+                    current_val = ws_s.cell(row=row, column=1).value
+                    if isinstance(current_val, str) and current_val.strip() == "설비수량":
+                        ws_s.insert_rows(row)
+                    ws_s.cell(row=row, column=1).value = line["category"]
+                    ws_s.cell(row=row, column=2).value = line["name"]
+                    ws_s.cell(row=row, column=5).value = line["qty"]
+                    ws_s.cell(row=row, column=6).value = line["price"]
+                    ws_s.cell(row=row, column=7).value = line["amount"]
+                    row += 1
+
+                try:
+                    ws_s["G16"].value = total_amount
+                except Exception:
+                    pass
+
+                hide_rows_with_value_in_col(ws_s, col_idx=1, value="1", exclude_rows=[42, 43, 44])
+        else:
+            messagebox.showwarning("알림", '"사양서" 시트를 찾을 수 없어 해당 시트에는 미반영되었습니다.')
+
+        if "현업 사인용 사양서" in wb.sheetnames:
+            ws_h = wb["현업 사인용 사양서"]
+            model_row = None
+            for r in range(1, ws_h.max_row + 1):
+                val = ws_h.cell(row=r, column=1).value
+                if isinstance(val, str) and val.strip() == "Model":
+                    model_row = r
+                    break
+
+            if model_row is not None:
+                row = model_row + 2
+                for line in self.quote_lines:
+                    ws_h.cell(row=row, column=1).value = line["category"]
+                    ws_h.cell(row=row, column=2).value = line["name"]
+                    ws_h.cell(row=row, column=5).value = line["qty"]
+                    row += 1
+
+                hide_rows_with_value_in_col(ws_h, col_idx=1, value="1", exclude_rows=[36])
+        else:
+            messagebox.showwarning("알림", '"현업 사인용 사양서" 시트를 찾을 수 없어 해당 시트에는 미반영되었습니다.')
+
+        try:
+            wb.save(path)
+            wb.close()
+        except Exception as e:
+            messagebox.showerror("오류", f"견적서 저장 실패:\n{e}")
+            return
+
+        messagebox.showinfo("완료", f"견적서가 저장되었습니다.\n{path}")
+
+        self.save_log(proc_name=proc_name, filename=filename)
+        self.add_saved_quote(path)
+
+    # --------------------------------------------------------
+    # 갑지 DATA
+    # --------------------------------------------------------
+    def build_gabji_data_auto(self):
+        children = self.quote_tree.get_children()
+        selected_paths = []
+        for iid in children:
+            vals = self.quote_tree.item(iid, "values")
+            if not vals:
+                continue
+            if vals[0] == "☑":
+                idx = int(iid)
+                if 0 <= idx < len(self.saved_quotes):
+                    selected_paths.append(self.saved_quotes[idx]["path"])
+
+        if not selected_paths:
+            messagebox.showwarning("알림", "체크된 견적서가 없습니다.")
+            return
+
+        self.gabji_builder.build_auto(selected_paths)
+
+    def build_gabji_data_manual(self):
+        self.gabji_builder.build_manual()
+
+
+# --------------------------------------------------------
+# MAIN
+# --------------------------------------------------------
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = QuoteBuilderGUI(root)
+    root.mainloop()
