@@ -1,3 +1,4 @@
+import os
 import sys
 import tempfile
 import types
@@ -39,6 +40,18 @@ class UtilsTests(unittest.TestCase):
         self.assertEqual(parsed, ("LINE", "PROC", "INV", "TOOL"))
 
         self.assertIsNone(quote_builder_gui.parse_quote_filename_g("invalid_name.xlsx"))
+
+    def test_compute_base_dir_uses_module_location(self):
+        base_dir = quote_builder_gui.compute_base_dir()
+        self.assertEqual(base_dir, os.path.dirname(str(MODULE_PATH)))
+
+    def test_compute_base_dir_falls_back_when_missing(self):
+        original_file = quote_builder_gui.__file__
+        try:
+            quote_builder_gui.__file__ = "/nonexistent/path/app.py"
+            self.assertEqual(quote_builder_gui.compute_base_dir(), os.getcwd())
+        finally:
+            quote_builder_gui.__file__ = original_file
 
 
 if __name__ == "__main__":

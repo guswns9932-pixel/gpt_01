@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import tkinter as tk
 from contextlib import contextmanager
 from datetime import datetime
@@ -44,6 +45,19 @@ def sanitize_filename_part(s: str) -> str:
     for ch in bad:
         s = s.replace(ch, '_')
     return s
+
+
+def compute_base_dir() -> str:
+    """Return the directory of the running script or bundled executable."""
+
+    if getattr(sys, "frozen", False):  # PyInstaller executable
+        candidate = os.path.dirname(sys.executable)
+    else:
+        candidate = os.path.dirname(os.path.abspath(__file__))
+
+    if os.path.isdir(candidate):
+        return candidate
+    return os.getcwd()
 
 
 def generate_unique_path(folder: str, base_filename: str) -> str:
@@ -254,6 +268,9 @@ class QuoteBuilderGUI:
         self.root.title("견적서 작성 자동화 ver.1.1")
         self.root.geometry("1680x900")
 
+        # 기본 파일 탐색 경로
+        self.base_dir = compute_base_dir()
+
         # 품목/견적 데이터
         self.items = []
         self.quote_lines = []
@@ -267,6 +284,9 @@ class QuoteBuilderGUI:
         self.code_var = tk.StringVar()
         self.vendor_var = tk.StringVar()
         self.proc_var = tk.StringVar()
+
+        # 코드 자동완성용 리스트
+        self.code_candidates = []
 
         # 품목 필터
         self.filter_var = tk.StringVar()
@@ -312,13 +332,17 @@ class QuoteBuilderGUI:
 
     # ----- file dialogs wrappers -----
     def ask_file(self, title, filetypes):
-        return filedialog.askopenfilename(title=title, filetypes=filetypes)
+        return filedialog.askopenfilename(
+            title=title, filetypes=filetypes, initialdir=self.base_dir
+        )
 
     def ask_files(self, title, filetypes):
-        return filedialog.askopenfilenames(title=title, filetypes=filetypes)
+        return filedialog.askopenfilenames(
+            title=title, filetypes=filetypes, initialdir=self.base_dir
+        )
 
     def ask_folder(self, title):
-        return filedialog.askdirectory(title=title)
+        return filedialog.askdirectory(title=title, initialdir=self.base_dir)
 
     # --------------------------------------------------------
     # UI (배치 수정 완료 버전)
@@ -437,6 +461,10 @@ class QuoteBuilderGUI:
         code_entry = tk.Entry(code_frame, textvariable=self.code_var)
         code_entry.grid(row=0, column=1, sticky="we", padx=5)
         code_entry.bind("<Return>", lambda e: self.apply_code_filter())
+        code_entry.bind("<KeyRelease>", self.on_code_key_release)
+        code_entry.bind("<Down>", self.focus_suggestion_box)
+        code_entry.bind("<Up>", self.focus_suggestion_box)
+        self.code_entry = code_entry
 
         tk.Label(code_frame, text="공정:", font=("맑은 고딕", 10)).grid(row=1, column=0, sticky="w")
         proc_combo = ttk.Combobox(code_frame, textvariable=self.proc_var, values=PROCESS_CHOICES, state="readonly")
@@ -451,6 +479,14 @@ class QuoteBuilderGUI:
         tk.Button(code_frame, text="추천 적용", command=self.apply_code_filter).grid(
             row=0, column=2, rowspan=3, padx=10
         )
+
+        self.suggestion_box = tk.Listbox(code_frame, height=6)
+        self.suggestion_box.bind("<ButtonRelease-1>", self.on_suggestion_click)
+        self.suggestion_box.bind("<Return>", self.on_suggestion_enter)
+        self.suggestion_box.bind("<Double-Button-1>", self.on_suggestion_enter)
+        self.suggestion_box.bind("<Escape>", lambda e: self.hide_suggestion_box())
+        self.suggestion_box.bind("<Up>", self.on_suggestion_nav)
+        self.suggestion_box.bind("<Down>", self.on_suggestion_nav)
 
         hint = tk.Frame(left)
         hint.pack(fill=tk.X, padx=5)
@@ -597,7 +633,7 @@ class QuoteBuilderGUI:
     # 상단 선택 기능
     # --------------------------------------------------------
     def select_quote_template(self):
-        path = filedialog.askopenfilename(
+        path = self.ask_file(
             title="견적서 양식 선택",
             filetypes=[("Excel 파일", "*.xlsx *.xlsm")]
         )
@@ -608,7 +644,7 @@ class QuoteBuilderGUI:
         self.lbl_quote_template.config(fg="black")
 
     def select_quote_folder(self):
-        folder = filedialog.askdirectory(title="견적 저장폴더 선택")
+        folder = self.ask_folder(title="견적 저장폴더 선택")
         if not folder:
             return
         self.quote_save_folder = folder
@@ -617,7 +653,7 @@ class QuoteBuilderGUI:
         self.lbl_quote_folder.config(fg="black")
 
     def select_gabji_template(self):
-        path = filedialog.askopenfilename(
+        path = self.ask_file(
             title="갑지 DATA 양식 선택",
             filetypes=[("Excel 파일", "*.xlsx *.xlsm")]
         )
@@ -707,6 +743,78 @@ class QuoteBuilderGUI:
                 self.left_tree.item(iid, tags=("used_item",))
             else:
                 self.left_tree.item(iid, tags=())
+
+    # --------------------------------------------------------
+    # 코드 자동완성
+    # --------------------------------------------------------
+    def on_code_key_release(self, event=None):
+        if event and event.keysym in {"Up", "Down", "Return"}:
+            return
+        self.populate_suggestion_box()
+
+    def focus_suggestion_box(self, event=None):
+        if not self.suggestion_box.winfo_ismapped():
+            self.populate_suggestion_box()
+        if self.suggestion_box.size() > 0:
+            self.suggestion_box.selection_clear(0, tk.END)
+            self.suggestion_box.selection_set(0)
+            self.suggestion_box.activate(0)
+            self.suggestion_box.focus_set()
+        return "break"
+
+    def populate_suggestion_box(self):
+        keyword = (self.code_var.get() or "").strip().lower()
+        matches = []
+        if keyword:
+            matches = [c for c in self.code_candidates if keyword in c.lower()]
+        if not matches:
+            self.hide_suggestion_box()
+            return
+
+        self.suggestion_box.delete(0, tk.END)
+        for code in matches:
+            self.suggestion_box.insert(tk.END, code)
+
+        x = self.code_entry.winfo_rootx() - self.code_entry.winfo_toplevel().winfo_rootx()
+        y = self.code_entry.winfo_rooty() - self.code_entry.winfo_toplevel().winfo_rooty() + self.code_entry.winfo_height()
+        self.suggestion_box.place(x=x, y=y, width=self.code_entry.winfo_width())
+        self.suggestion_box.lift()
+
+    def hide_suggestion_box(self):
+        self.suggestion_box.place_forget()
+        self.code_entry.focus_set()
+
+    def on_suggestion_click(self, event=None):
+        self.select_suggestion()
+
+    def on_suggestion_enter(self, event=None):
+        self.select_suggestion()
+        return "break"
+
+    def on_suggestion_nav(self, event):
+        size = self.suggestion_box.size()
+        if size == 0:
+            return "break"
+        cur = self.suggestion_box.curselection()
+        idx = cur[0] if cur else -1
+        if event.keysym == "Down" and idx < size - 1:
+            idx += 1
+        elif event.keysym == "Up" and idx > 0:
+            idx -= 1
+        self.suggestion_box.selection_clear(0, tk.END)
+        self.suggestion_box.selection_set(idx)
+        self.suggestion_box.activate(idx)
+        return "break"
+
+    def select_suggestion(self):
+        cur = self.suggestion_box.curselection()
+        if not cur:
+            self.hide_suggestion_box()
+            return
+        value = self.suggestion_box.get(cur[0])
+        self.code_var.set(value)
+        self.hide_suggestion_box()
+        self.apply_code_filter()
 
     # --------------------------------------------------------
     # 라인/공정/투자자/설비호기 입력
@@ -820,7 +928,7 @@ class QuoteBuilderGUI:
     # 품목 엑셀 로드
     # --------------------------------------------------------
     def load_items_from_excel(self):
-        path = filedialog.askopenfilename(
+        path = self.ask_file(
             title="품목 엑셀 파일 선택",
             filetypes=[("Excel 파일", "*.xlsx *.xlsm *.xls")]
         )
@@ -842,6 +950,8 @@ class QuoteBuilderGUI:
                 self.name_to_index.clear()
                 self.code_to_indexes.clear()
                 self.code_qty.clear()
+                self.code_candidates = []
+                code_seen = set()
 
                 for row in ws_items.iter_rows(min_row=2, values_only=True):
                     if not row:
@@ -876,6 +986,10 @@ class QuoteBuilderGUI:
                         qty = row[4] if len(row) > 4 else ""
                         if not code or not item_name:
                             continue
+                        code_text = str(code).strip()
+                        if code_text and code_text not in code_seen:
+                            self.code_candidates.append(code_text)
+                            code_seen.add(code_text)
                         name_key = norm_name(item_name)
                         if name_key not in self.name_to_index:
                             continue
