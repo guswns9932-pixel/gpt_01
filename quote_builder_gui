@@ -1,8 +1,10 @@
 import os
 import re
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from contextlib import contextmanager
 from datetime import datetime
+from tkinter import filedialog, messagebox, simpledialog, ttk
+
 from openpyxl import Workbook, load_workbook
 
 
@@ -42,6 +44,30 @@ def sanitize_filename_part(s: str) -> str:
     for ch in bad:
         s = s.replace(ch, '_')
     return s
+
+
+def generate_unique_path(folder: str, base_filename: str) -> str:
+    path = os.path.join(folder, base_filename)
+    if not os.path.exists(path):
+        return path
+
+    name_only, ext_only = os.path.splitext(base_filename)
+    counter = 1
+    while True:
+        filename = f"{name_only}_{counter}{ext_only}"
+        path = os.path.join(folder, filename)
+        if not os.path.exists(path):
+            return path
+        counter += 1
+
+
+@contextmanager
+def open_workbook(path: str, **kwargs):
+    wb = load_workbook(path, **kwargs)
+    try:
+        yield wb
+    finally:
+        wb.close()
 
 
 def hide_rows_with_value_in_col(ws, col_idx: int, value, exclude_rows=None):
@@ -122,108 +148,87 @@ class GabjiBuilder:
         keep_vba = (ext == ".xlsm")
 
         try:
-            wb_t = load_workbook(template_path, keep_vba=keep_vba)
-        except Exception as e:
-            messagebox.showerror("오류", f"갑지 DATA 양식 엑셀 로드 실패:\n{e}")
-            return
+            with open_workbook(template_path, keep_vba=keep_vba) as wb_t:
+                if "갑지 DATA" not in wb_t.sheetnames:
+                    messagebox.showerror("오류", '"갑지 DATA" 시트를 찾을 수 없습니다.')
+                    return
 
-        if "갑지 DATA" not in wb_t.sheetnames:
-            messagebox.showerror("오류", '"갑지 DATA" 시트를 찾을 수 없습니다.')
-            return
+                ws_g = wb_t["갑지 DATA"]
+                max_row = ws_g.max_row
+                max_col = ws_g.max_column
 
-        ws_g = wb_t["갑지 DATA"]
-        max_row = ws_g.max_row
-        max_col = ws_g.max_column
+                # 2행부터 값만 초기화(스타일 유지)
+                if max_row >= 2:
+                    for r in range(2, max_row + 1):
+                        for c in range(1, max_col + 1):
+                            ws_g.cell(row=r, column=c).value = None
 
-        # 2행부터 값만 초기화(스타일 유지)
-        if max_row >= 2:
-            for r in range(2, max_row + 1):
-                for c in range(1, max_col + 1):
-                    ws_g.cell(row=r, column=c).value = None
+                # 데이터 수집
+                combined_rows = []
+                for q_path in quote_paths:
+                    if not os.path.exists(q_path):
+                        continue
+                    try:
+                        with open_workbook(q_path, data_only=True) as wb_q:
+                            if "견적의뢰복사본" not in wb_q.sheetnames:
+                                continue
 
-        # 데이터 수집
-        combined_rows = []
-        for q_path in quote_paths:
-            if not os.path.exists(q_path):
-                continue
-            try:
-                wb_q = load_workbook(q_path, data_only=True)
-            except Exception:
-                continue
+                            ws_q = wb_q["견적의뢰복사본"]
+                            for row in ws_q.iter_rows(min_row=2, values_only=True):
+                                if not row or all(v is None for v in row):
+                                    continue
+                                combined_rows.append(list(row))
+                    except Exception:
+                        continue
 
-            if "견적의뢰복사본" not in wb_q.sheetnames:
-                wb_q.close()
-                continue
+                if not combined_rows:
+                    messagebox.showwarning("알림", "선택된 견적서들에서 가져올 데이터가 없습니다.")
+                    return
 
-            ws_q = wb_q["견적의뢰복사본"]
-            for row in ws_q.iter_rows(min_row=2, values_only=True):
-                if not row or all(v is None for v in row):
-                    continue
-                combined_rows.append(list(row))
+                # D열 기준 정렬(혼합 타입 안전)
+                def sort_key(r):
+                    if len(r) <= 3:
+                        return (1, "")
+                    d_val = r[3]
+                    if d_val is None:
+                        return (1, "")
+                    return (0, str(d_val))
 
-            wb_q.close()
+                combined_rows.sort(key=sort_key)
 
-        if not combined_rows:
-            messagebox.showwarning("알림", "선택된 견적서들에서 가져올 데이터가 없습니다.")
-            return
+                # 스타일 복사
+                def copy_row_style(ws, src_row, dest_row, max_col_):
+                    for col in range(1, max_col_ + 1):
+                        src_cell = ws.cell(row=src_row, column=col)
+                        dest_cell = ws.cell(row=dest_row, column=col)
+                        dest_cell._style = src_cell._style
 
-        # D열 기준 정렬(혼합 타입 안전)
-        def sort_key(r):
-            if len(r) <= 3:
-                return (1, "")
-            d_val = r[3]
-            if d_val is None:
-                return (1, "")
-            return (0, str(d_val))
+                # 입력(2행부터)
+                start_row = 2
+                current_max_row = ws_g.max_row
 
-        combined_rows.sort(key=sort_key)
+                for i, row_vals in enumerate(combined_rows, start=start_row):
+                    if i > current_max_row:
+                        ws_g.insert_rows(i)
+                        copy_row_style(ws_g, 2, i, max_col)
+                        current_max_row += 1
+                    else:
+                        copy_row_style(ws_g, 2, i, max_col)
 
-        # 스타일 복사
-        def copy_row_style(ws, src_row, dest_row, max_col_):
-            for col in range(1, max_col_ + 1):
-                src_cell = ws.cell(row=src_row, column=col)
-                dest_cell = ws.cell(row=dest_row, column=col)
-                dest_cell._style = src_cell._style
+                    for c, val in enumerate(row_vals, start=1):
+                        ws_g.cell(row=i, column=c).value = val
 
-        # 입력(2행부터)
-        start_row = 2
-        current_max_row = ws_g.max_row
+                # 파일명 생성(복사 후 K2/J2 읽기)
+                k2_val = ws_g["K2"].value or ""
+                j2_val = ws_g["J2"].value or ""
+                k2 = sanitize_filename_part(k2_val)
+                j2 = sanitize_filename_part(j2_val)
 
-        for i, row_vals in enumerate(combined_rows, start=start_row):
-            if i > current_max_row:
-                ws_g.insert_rows(i)
-                copy_row_style(ws_g, 2, i, max_col)
-                current_max_row += 1
-            else:
-                copy_row_style(ws_g, 2, i, max_col)
+                today = datetime.now().strftime("%y%m%d")
+                base_filename = f"{today}_LOT베큠_{k2}_{j2}.xlsx"
+                path = generate_unique_path(save_folder, base_filename)
 
-            for c, val in enumerate(row_vals, start=1):
-                ws_g.cell(row=i, column=c).value = val
-
-        # 파일명 생성(복사 후 K2/J2 읽기)
-        k2_val = ws_g["K2"].value
-        j2_val = ws_g["J2"].value
-        k2 = sanitize_filename_part(k2_val)
-        j2 = sanitize_filename_part(j2_val)
-
-        today = datetime.now().strftime("%y%m%d")
-        base_filename = f"{today}_LOT베큠_{k2}_{j2}.xlsx"
-        filename = base_filename
-        path = os.path.join(save_folder, filename)
-
-        # 중복 방지
-        if os.path.exists(path):
-            name_only, ext_only = os.path.splitext(base_filename)
-            counter = 1
-            while True:
-                filename = f"{name_only}_{counter}{ext_only}"
-                path = os.path.join(save_folder, filename)
-                if not os.path.exists(path):
-                    break
-                counter += 1
-
-        try:
-            wb_t.save(path)
+                wb_t.save(path)
         except Exception as e:
             messagebox.showerror("오류", f"갑지 DATA 파일 저장 실패:\n{e}")
             return
@@ -632,24 +637,21 @@ class QuoteBuilderGUI:
             return
 
         try:
-            wb = load_workbook(log_path, data_only=True)
-            if "Log" not in wb.sheetnames:
-                wb.close()
-                return
-            ws = wb["Log"]
+            with open_workbook(log_path, data_only=True) as wb:
+                if "Log" not in wb.sheetnames:
+                    return
+                ws = wb["Log"]
+
+                records = []
+                for row in ws.iter_rows(min_row=2, values_only=True):
+                    filename_g = row[6]
+                    if not filename_g:
+                        continue
+                    parsed = parse_quote_filename_g(filename_g)
+                    if parsed:
+                        records.append(parsed)
         except Exception:
             return
-
-        records = []
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            filename_g = row[6]
-            if not filename_g:
-                continue
-            parsed = parse_quote_filename_g(filename_g)
-            if parsed:
-                records.append(parsed)
-
-        wb.close()
 
         if not records:
             self.latest_quad_from_log = None
@@ -826,64 +828,61 @@ class QuoteBuilderGUI:
             return
 
         try:
-            wb = load_workbook(path, data_only=True)
+            with open_workbook(path, data_only=True) as wb:
+                if "품목" not in wb.sheetnames:
+                    messagebox.showerror("오류", "'품목' 시트를 찾을 수 없습니다.")
+                    return
 
-            if "품목" not in wb.sheetnames:
-                messagebox.showerror("오류", "'품목' 시트를 찾을 수 없습니다.")
-                return
+                ws_items = wb["품목"]
 
-            ws_items = wb["품목"]
+                self.items.clear()
+                self.quote_lines.clear()
+                self.left_tree.delete(*self.left_tree.get_children())
+                self.tree.delete(*self.tree.get_children())
+                self.name_to_index.clear()
+                self.code_to_indexes.clear()
+                self.code_qty.clear()
 
-            self.items.clear()
-            self.quote_lines.clear()
-            self.left_tree.delete(*self.left_tree.get_children())
-            self.tree.delete(*self.tree.get_children())
-            self.name_to_index.clear()
-            self.code_to_indexes.clear()
-            self.code_qty.clear()
-
-            for row in ws_items.iter_rows(min_row=2, values_only=True):
-                if not row:
-                    continue
-                category = row[0]
-                name = row[1]
-                price = row[2] if len(row) > 2 else 0
-                if not name:
-                    continue
-                try:
-                    price = int(price)
-                except Exception:
-                    price = 0
-                if price == 0:
-                    continue
-
-                name_key = norm_name(name)
-                idx = len(self.items)
-                item = {"category": category or "", "name": str(name), "price": price}
-                self.items.append(item)
-                self.name_to_index[name_key] = idx
-
-            if "코드매핑" in wb.sheetnames:
-                ws_codes = wb["코드매핑"]
-                for row in ws_codes.iter_rows(min_row=2, values_only=True):
+                for row in ws_items.iter_rows(min_row=2, values_only=True):
                     if not row:
                         continue
-                    code = row[0]
-                    proc = row[1]
-                    vendor = row[2]
-                    item_name = row[3]
-                    qty = row[4] if len(row) > 4 else ""
-                    if not code or not item_name:
+                    category = row[0]
+                    name = row[1]
+                    price = row[2] if len(row) > 2 else 0
+                    if not name:
                         continue
-                    name_key = norm_name(item_name)
-                    if name_key not in self.name_to_index:
+                    try:
+                        price = int(price)
+                    except Exception:
+                        price = 0
+                    if price == 0:
                         continue
-                    idx = self.name_to_index[name_key]
-                    full_key = f"{norm(code)}|{norm(proc)}|{norm(vendor)}"
-                    self.code_to_indexes.setdefault(full_key, set()).add(idx)
-                    self.code_qty[(full_key, idx)] = qty if qty is not None else ""
 
-            wb.close()
+                    name_key = norm_name(name)
+                    idx = len(self.items)
+                    item = {"category": category or "", "name": str(name), "price": price}
+                    self.items.append(item)
+                    self.name_to_index[name_key] = idx
+
+                if "코드매핑" in wb.sheetnames:
+                    ws_codes = wb["코드매핑"]
+                    for row in ws_codes.iter_rows(min_row=2, values_only=True):
+                        if not row:
+                            continue
+                        code = row[0]
+                        proc = row[1]
+                        vendor = row[2]
+                        item_name = row[3]
+                        qty = row[4] if len(row) > 4 else ""
+                        if not code or not item_name:
+                            continue
+                        name_key = norm_name(item_name)
+                        if name_key not in self.name_to_index:
+                            continue
+                        idx = self.name_to_index[name_key]
+                        full_key = f"{norm(code)}|{norm(proc)}|{norm(vendor)}"
+                        self.code_to_indexes.setdefault(full_key, set()).add(idx)
+                        self.code_qty[(full_key, idx)] = qty if qty is not None else ""
 
             self.rebuild_left_tree()
             self.refresh_tree()
@@ -1136,14 +1135,13 @@ class QuoteBuilderGUI:
             ws.append(["날짜", "공정", "설비사", "품목", "수량", "금액", "견적서파일명"])
             wb.save(log_path)
 
-        wb = load_workbook(log_path)
-        ws = wb["Log"] if "Log" in wb.sheetnames else wb.active
+        with open_workbook(log_path) as wb:
+            ws = wb["Log"] if "Log" in wb.sheetnames else wb.active
 
-        for q in self.quote_lines:
-            ws.append([now, proc_name, vendor, q["name"], q["qty"], q["amount"], filename])
+            for q in self.quote_lines:
+                ws.append([now, proc_name, vendor, q["name"], q["qty"], q["amount"], filename])
 
-        wb.save(log_path)
-        wb.close()
+            wb.save(log_path)
 
         self.load_history_from_log()
 
@@ -1236,122 +1234,105 @@ class QuoteBuilderGUI:
         keep_vba = (ext == ".xlsm")
 
         try:
-            wb = load_workbook(template_path, keep_vba=keep_vba)
+            with open_workbook(template_path, keep_vba=keep_vba) as wb:
+                folder = self.quote_save_folder
+                today = datetime.now().strftime("%y%m%d")
+
+                safe_line = sanitize_filename_part(line_name)
+                safe_proc = sanitize_filename_part(proc_name)
+                safe_inv = sanitize_filename_part(investor)
+                safe_tool = sanitize_filename_part(tool)
+
+                base_filename = f"{today}_LOT베큠_{safe_line}_{safe_proc}_{safe_inv}({safe_tool}).xlsx"
+                path = generate_unique_path(folder, base_filename)
+                filename = os.path.basename(path)
+
+                total_amount = sum(x["amount"] for x in self.quote_lines)
+
+                from openpyxl.styles import Font, Alignment
+
+                if "견적서" in wb.sheetnames:
+                    wb.remove(wb["견적서"])
+                ws_q = wb.create_sheet("견적서")
+
+                ws_q["A1"] = "견적서"
+                ws_q["A1"].font = Font(size=16, bold=True)
+                ws_q.merge_cells("A1:G1")
+                ws_q["A1"].alignment = Alignment(horizontal="center")
+
+                ws_q.append(["분류", "품목명", "", "", "단가", "수량", "금액"])
+                for cell in ws_q[2]:
+                    cell.font = Font(bold=True)
+
+                for line in self.quote_lines:
+                    ws_q.append([line["category"], line["name"], "", "", line["price"], line["qty"], line["amount"]])
+
+                ws_q.append(["", "", "", "", "", "합계", total_amount])
+
+                ws_q.column_dimensions["A"].width = 15
+                ws_q.column_dimensions["B"].width = 40
+                ws_q.column_dimensions["C"].width = 8
+                ws_q.column_dimensions["D"].width = 8
+                ws_q.column_dimensions["E"].width = 15
+                ws_q.column_dimensions["F"].width = 10
+                ws_q.column_dimensions["G"].width = 15
+
+                if "사양서" in wb.sheetnames:
+                    ws_s = wb["사양서"]
+                    rack_row = None
+                    for r in range(1, ws_s.max_row + 1):
+                        val = ws_s.cell(row=r, column=1).value
+                        if isinstance(val, str) and val.strip() == "Rack system":
+                            rack_row = r
+                            break
+
+                    if rack_row is not None:
+                        row = rack_row + 1
+                        for line in self.quote_lines:
+                            current_val = ws_s.cell(row=row, column=1).value
+                            if isinstance(current_val, str) and current_val.strip() == "설비수량":
+                                ws_s.insert_rows(row)
+                            ws_s.cell(row=row, column=1).value = line["category"]
+                            ws_s.cell(row=row, column=2).value = line["name"]
+                            ws_s.cell(row=row, column=5).value = line["qty"]
+                            ws_s.cell(row=row, column=6).value = line["price"]
+                            ws_s.cell(row=row, column=7).value = line["amount"]
+                            row += 1
+
+                        try:
+                            ws_s["G16"].value = total_amount
+                        except Exception:
+                            pass
+
+                        hide_rows_with_value_in_col(ws_s, col_idx=1, value="1", exclude_rows=[42, 43, 44])
+                else:
+                    messagebox.showwarning("알림", '"사양서" 시트를 찾을 수 없어 해당 시트에는 미반영되었습니다.')
+
+                if "현업 사인용 사양서" in wb.sheetnames:
+                    ws_h = wb["현업 사인용 사양서"]
+                    model_row = None
+                    for r in range(1, ws_h.max_row + 1):
+                        val = ws_h.cell(row=r, column=1).value
+                        if isinstance(val, str) and val.strip() == "Model":
+                            model_row = r
+                            break
+
+                    if model_row is not None:
+                        row = model_row + 2
+                        for line in self.quote_lines:
+                            ws_h.cell(row=row, column=1).value = line["category"]
+                            ws_h.cell(row=row, column=2).value = line["name"]
+                            ws_h.cell(row=row, column=5).value = line["qty"]
+                            row += 1
+
+                        hide_rows_with_value_in_col(ws_h, col_idx=1, value="1", exclude_rows=[36])
+                else:
+                    messagebox.showwarning("알림", '"현업 사인용 사양서" 시트를 찾을 수 없어 해당 시트에는 미반영되었습니다.')
+
+                wb.save(path)
         except Exception as e:
             messagebox.showerror("오류", f"양식 엑셀 로드 실패:\n{e}")
             return
-
-        folder = self.quote_save_folder
-        today = datetime.now().strftime("%y%m%d")
-
-        safe_line = sanitize_filename_part(line_name)
-        safe_proc = sanitize_filename_part(proc_name)
-        safe_inv = sanitize_filename_part(investor)
-        safe_tool = sanitize_filename_part(tool)
-
-        base_filename = f"{today}_LOT베큠_{safe_line}_{safe_proc}_{safe_inv}({safe_tool}).xlsx"
-        filename = base_filename
-        path = os.path.join(folder, filename)
-
-        if os.path.exists(path):
-            name_only, ext_only = os.path.splitext(base_filename)
-            counter = 1
-            while True:
-                filename = f"{name_only}_{counter}{ext_only}"
-                path = os.path.join(folder, filename)
-                if not os.path.exists(path):
-                    break
-                counter += 1
-
-        total_amount = sum(x["amount"] for x in self.quote_lines)
-
-        from openpyxl.styles import Font, Alignment
-
-        if "견적서" in wb.sheetnames:
-            wb.remove(wb["견적서"])
-        ws_q = wb.create_sheet("견적서")
-
-        ws_q["A1"] = "견적서"
-        ws_q["A1"].font = Font(size=16, bold=True)
-        ws_q.merge_cells("A1:G1")
-        ws_q["A1"].alignment = Alignment(horizontal="center")
-
-        ws_q.append(["분류", "품목명", "", "", "단가", "수량", "금액"])
-        for cell in ws_q[2]:
-            cell.font = Font(bold=True)
-
-        for line in self.quote_lines:
-            ws_q.append([line["category"], line["name"], "", "", line["price"], line["qty"], line["amount"]])
-
-        ws_q.append(["", "", "", "", "", "합계", total_amount])
-
-        ws_q.column_dimensions["A"].width = 15
-        ws_q.column_dimensions["B"].width = 40
-        ws_q.column_dimensions["C"].width = 8
-        ws_q.column_dimensions["D"].width = 8
-        ws_q.column_dimensions["E"].width = 15
-        ws_q.column_dimensions["F"].width = 10
-        ws_q.column_dimensions["G"].width = 15
-
-        if "사양서" in wb.sheetnames:
-            ws_s = wb["사양서"]
-            rack_row = None
-            for r in range(1, ws_s.max_row + 1):
-                val = ws_s.cell(row=r, column=1).value
-                if isinstance(val, str) and val.strip() == "Rack system":
-                    rack_row = r
-                    break
-
-            if rack_row is not None:
-                row = rack_row + 1
-                for line in self.quote_lines:
-                    current_val = ws_s.cell(row=row, column=1).value
-                    if isinstance(current_val, str) and current_val.strip() == "설비수량":
-                        ws_s.insert_rows(row)
-                    ws_s.cell(row=row, column=1).value = line["category"]
-                    ws_s.cell(row=row, column=2).value = line["name"]
-                    ws_s.cell(row=row, column=5).value = line["qty"]
-                    ws_s.cell(row=row, column=6).value = line["price"]
-                    ws_s.cell(row=row, column=7).value = line["amount"]
-                    row += 1
-
-                try:
-                    ws_s["G16"].value = total_amount
-                except Exception:
-                    pass
-
-                hide_rows_with_value_in_col(ws_s, col_idx=1, value="1", exclude_rows=[42, 43, 44])
-        else:
-            messagebox.showwarning("알림", '"사양서" 시트를 찾을 수 없어 해당 시트에는 미반영되었습니다.')
-
-        if "현업 사인용 사양서" in wb.sheetnames:
-            ws_h = wb["현업 사인용 사양서"]
-            model_row = None
-            for r in range(1, ws_h.max_row + 1):
-                val = ws_h.cell(row=r, column=1).value
-                if isinstance(val, str) and val.strip() == "Model":
-                    model_row = r
-                    break
-
-            if model_row is not None:
-                row = model_row + 2
-                for line in self.quote_lines:
-                    ws_h.cell(row=row, column=1).value = line["category"]
-                    ws_h.cell(row=row, column=2).value = line["name"]
-                    ws_h.cell(row=row, column=5).value = line["qty"]
-                    row += 1
-
-                hide_rows_with_value_in_col(ws_h, col_idx=1, value="1", exclude_rows=[36])
-        else:
-            messagebox.showwarning("알림", '"현업 사인용 사양서" 시트를 찾을 수 없어 해당 시트에는 미반영되었습니다.')
-
-        try:
-            wb.save(path)
-            wb.close()
-        except Exception as e:
-            messagebox.showerror("오류", f"견적서 저장 실패:\n{e}")
-            return
-
         messagebox.showinfo("완료", f"견적서가 저장되었습니다.\n{path}")
 
         self.save_log(proc_name=proc_name, filename=filename)
