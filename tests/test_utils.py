@@ -45,6 +45,14 @@ class UtilsTests(unittest.TestCase):
         base_dir = quote_builder_gui.compute_base_dir()
         self.assertEqual(base_dir, os.path.dirname(str(MODULE_PATH)))
 
+    def test_compute_base_dir_falls_back_when_missing(self):
+        original_file = quote_builder_gui.__file__
+        try:
+            quote_builder_gui.__file__ = "/nonexistent/path/app.py"
+            self.assertEqual(quote_builder_gui.compute_base_dir(), os.getcwd())
+        finally:
+            quote_builder_gui.__file__ = original_file
+
 
 if __name__ == "__main__":
     unittest.main()

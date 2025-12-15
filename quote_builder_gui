@@ -51,8 +51,13 @@ def compute_base_dir() -> str:
     """Return the directory of the running script or bundled executable."""
 
     if getattr(sys, "frozen", False):  # PyInstaller executable
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+        candidate = os.path.dirname(sys.executable)
+    else:
+        candidate = os.path.dirname(os.path.abspath(__file__))
+
+    if os.path.isdir(candidate):
+        return candidate
+    return os.getcwd()
 
 
 def generate_unique_path(folder: str, base_filename: str) -> str:
